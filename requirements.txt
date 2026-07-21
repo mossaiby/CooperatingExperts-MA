@@ -1,0 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+transformers>=4.44
+accelerate>=0.33
+bitsandbytes>=0.43
+peft>=0.12
+datasets>=2.20
+torch>=2.2
+sentencepiece
+protobuf
