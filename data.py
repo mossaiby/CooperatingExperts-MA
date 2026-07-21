@@ -29,11 +29,34 @@ def _line_count(code: str) -> int:
 
 
 def build_pairs(cfg: DataConfig):
-    print(f"Loading CodeSearchNet ({cfg.codesearchnet_config}) ...")
-    ds = load_dataset(
-        "code_search_net", cfg.codesearchnet_config,
-        cache_dir=cfg.cache_dir, trust_remote_code=True,
-    )["train"]
+    """
+    Loads a CodeSearchNet Python mirror and extracts (docstring, code) pairs.
+
+    NOTE: the original `code_search_net` dataset repo on the HF hub ships as
+    a legacy loading SCRIPT, and `datasets>=4.0` dropped script-based
+    dataset support entirely (not just deprecated -- it's a hard error now,
+    `HfUriError`/`trust_remote_code` no longer works around it). We use a
+    pre-converted, script-free mirror instead. Field names vary slightly
+    across mirrors, so this pulls from several plausible column names
+    rather than hardcoding one.
+    """
+    print(f"Loading CodeSearchNet Python mirror ({cfg.hf_dataset_id}) ...")
+    ds = load_dataset(cfg.hf_dataset_id, split=cfg.hf_dataset_split,
+                       cache_dir=cfg.cache_dir)
+
+    code_field_candidates = ["code", "func_code_string", "whole_func_string", "content"]
+    doc_field_candidates = ["docstring", "func_documentation_string", "summary", "description"]
+
+    cols = set(ds.column_names)
+    code_field = next((f for f in code_field_candidates if f in cols), None)
+    doc_field = next((f for f in doc_field_candidates if f in cols), None)
+    if code_field is None or doc_field is None:
+        raise ValueError(
+            f"Couldn't find recognizable code/docstring columns in {cfg.hf_dataset_id}. "
+            f"Available columns: {sorted(cols)}. Update code_field_candidates/"
+            f"doc_field_candidates in data.py to match this mirror's schema."
+        )
+    print(f"Using columns: code={code_field!r}, docstring={doc_field!r}")
 
     seen_funcs = set()
     seen_docs = set()
@@ -47,9 +70,8 @@ def build_pairs(cfg: DataConfig):
         if len(pairs) >= cfg.n_pairs:
             break
         row = ds[idx]
-        code = row.get("func_code_string") or row.get("whole_func_string") or ""
-        doc = row.get("func_documentation_string") or ""
-        doc = _clean_docstring(doc)
+        code = row.get(code_field) or ""
+        doc = _clean_docstring(row.get(doc_field) or "")
 
         if len(doc.split()) < cfg.min_docstring_words:
             continue

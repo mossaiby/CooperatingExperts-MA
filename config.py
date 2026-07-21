@@ -109,7 +109,14 @@ class HandoffLayerConfig:
 
 @dataclass
 class DataConfig:
-    codesearchnet_config: str = "python"
+    # code_search_net's own HF repo is a legacy loading SCRIPT, which
+    # datasets>=4.0 no longer supports at all. Use a pre-converted,
+    # script-free Parquet mirror instead. If this specific mirror ever
+    # moves/breaks, swap in another Parquet-format CodeSearchNet Python
+    # mirror here -- build_pairs() auto-detects column names across a few
+    # common schemas.
+    hf_dataset_id: str = "Nan-Do/code-search-net-python"
+    hf_dataset_split: str = "train"
     n_pairs: int = 20000
     min_docstring_words: int = 4
     min_function_lines: int = 2
