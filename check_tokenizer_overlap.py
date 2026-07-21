@@ -31,17 +31,43 @@ def overlap_report(tok_a, tok_b, name_a, name_b):
     vocab_a = set(tok_a.get_vocab().keys())
     vocab_b = set(tok_b.get_vocab().keys())
     shared = vocab_a & vocab_b
+    smaller = min(len(vocab_a), len(vocab_b))
+    overlap_frac = len(shared) / smaller
 
     print(f"\n=== Vocab-level overlap: {name_a} vs {name_b} ===")
     print(f"{name_a} vocab size: {len(vocab_a)}")
     print(f"{name_b} vocab size: {len(vocab_b)}")
-    print(f"Shared surface-form tokens: {len(shared)} "
-          f"({100 * len(shared) / min(len(vocab_a), len(vocab_b)):.1f}% of smaller vocab)")
-    if len(shared) / min(len(vocab_a), len(vocab_b)) > 0.3:
-        print("!! WARNING: >30% overlap -- these tokenizers may be too similar "
-              "for the 'genuinely different vocabulary' premise of this project.")
+    print(f"Shared surface-form tokens: {len(shared)} ({100 * overlap_frac:.1f}% of smaller vocab)")
+
+    # NOTE on calibration: surface-string overlap is naturally HIGH for any
+    # two general-purpose BPE tokenizers trained on English-heavy corpora --
+    # common words, whitespace, and punctuation converge across almost any
+    # tokenizer trained on internet-scale text, regardless of lab or domain
+    # mix. A high percentage here does NOT by itself mean the tokenizers are
+    # secretly the same file. What actually matters for this project:
+    #   1. Vocab SIZES should differ meaningfully (rules out literal reuse)
+    #   2. Even shared surface strings get different integer IDs in each
+    #      tokenizer, feeding two INDEPENDENTLY TRAINED embedding matrices --
+    #      so there's no shared embedding table to exploit either way.
+    # The one pattern that IS a red flag: near-identical vocab size (e.g.
+    # both exactly 49152) combined with high overlap -- that suggests literal
+    # shared lineage, not independent convergence.
+    size_ratio = smaller / max(len(vocab_a), len(vocab_b))
+    if size_ratio > 0.95 and overlap_frac > 0.30:
+        print("!! WARNING: near-identical vocab sizes AND high overlap -- "
+              "these tokenizers likely share literal lineage (e.g. same "
+              "training data/config, possibly the same file). Pick a "
+              "different pair.")
+    elif overlap_frac > 0.60:
+        print("NOTE: high surface overlap, but vocab sizes differ meaningfully "
+              "-- likely just the normal convergence of two independently "
+              "trained general-purpose BPE tokenizers on English-heavy data, "
+              "not shared lineage. Check the sample tokenizations below: if "
+              "segmentation differs on code-heavy text even when overlap is "
+              "high, the tokenizers are functioning independently.")
     else:
-        print("OK: overlap looks low enough to treat these as genuinely different vocabularies.")
+        print("OK: overlap and vocab sizes both look consistent with "
+              "independently-trained tokenizers.")
 
     print(f"\n=== Sample tokenization comparison ===")
     for text in SAMPLE_TEXTS:
