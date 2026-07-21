@@ -113,12 +113,12 @@ class FrozenExpert(nn.Module):
 
         new_ids = set(self.new_token_ids)
         vocab_size = emb.weight.shape[0]
-        mask = torch.zeros(vocab_size, 1, device=emb.weight.device)
+        mask = torch.zeros(vocab_size, 1, device=emb.weight.device, dtype=emb.weight.dtype)
         for i in new_ids:
             mask[i, 0] = 1.0
 
         def _mask_grad(grad):
-            return grad * mask
+            return grad * mask.to(grad.dtype)
         emb.weight.register_hook(_mask_grad)
 
         out_emb = self.backbone.get_output_embeddings()
