@@ -22,17 +22,30 @@ class ExpertSpec:
 
 @dataclass
 class ModelPairConfig:
-    """Which two pretrained models play the two experts."""
+    """
+    Which two pretrained models play the two experts.
+
+    IMPORTANT: pick models from DIFFERENT labs with independently-trained
+    tokenizers. Same-lab pairs (e.g. SmolLM2 + StarCoder2, or Qwen2.5 +
+    Qwen2.5-Coder) often secretly share a tokenizer or its lineage, which
+    defeats the "genuinely different vocabulary" premise of this project
+    even when the models themselves are fine-tuned for different domains.
+    ALWAYS run check_tokenizer_overlap.py after changing this and confirm
+    low overlap before training anything.
+    """
     english: ExpertSpec = field(default_factory=lambda: ExpertSpec(
         name="english",
-        hf_model_id="HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        hf_model_id="meta-llama/Llama-3.2-1B",
         role="general / English prose",
     ))
     python: ExpertSpec = field(default_factory=lambda: ExpertSpec(
         name="python",
-        hf_model_id="bigcode/starcoder2-3b",
+        hf_model_id="deepseek-ai/deepseek-coder-1.3b-base",
         role="Python code",
     ))
+    # Non-gated fallback for the english slot if Llama-3.2 access isn't
+    # approved on your HF account yet:
+    #   hf_model_id="google/gemma-2-2b"   (SentencePiece, 256k vocab)
 
 
 @dataclass
