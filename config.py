@@ -138,14 +138,14 @@ class StitchTrainConfig:
     warmup_steps: int = 100
     steps_max: int = 3000
     align_weight: float = 0.1
-    val_every: int = 100
+    val_every: int = 20
     early_stop_patience: int = 5
     early_stop_min_delta: float = 1e-3
     grad_clip: float = 1.0
     grad_checkpointing: bool = True
-    log_every: int = 20
+    log_every: int = 5
     ckpt_dir: str = "checkpoints"
-    ckpt_every: int = 200          # frequent, Colab disconnects
+    ckpt_every: int = 20           # very frequent -- sessions have been dying <30 steps in
 
 
 @dataclass
