@@ -1,8 +1,10 @@
 """
 FrozenExpert: wraps one pretrained HF causal-LM as a frozen "expert" with:
   - a frozen backbone (4-bit if configured)
-  - new <switch:*> special tokens, with a gradient mask so only the NEW
-    embedding/head rows are trainable (not the whole 100k+-row vocab)
+  - new <switch:*> special tokens, routed through small standalone
+    [num_new, hidden] parameters patched into the embedding lookup and
+    output head, so the pretrained vocab's ~100k+ rows are never touched
+    and never carry optimizer state
   - to_shared / from_shared bridge projections (always trainable)
   - helpers to extract a handoff hidden vector from a chosen layer, and to
     run the backbone with a hidden vector injected as a virtual position 0
@@ -25,6 +27,67 @@ def _resolve_layer_index(num_layers: int, handoff_cfg: HandoffLayerConfig) -> in
             idx = num_layers + idx
         return max(0, min(idx, num_layers))
     return max(0, min(round(num_layers * handoff_cfg.layer_fraction), num_layers))
+
+
+class _PatchedEmbedding(nn.Module):
+    """
+    Wraps a frozen nn.Embedding. Lookups for token ids below `new_start_idx`
+    go through the frozen weight as normal (no grad). Lookups for ids >=
+    new_start_idx (the newly added <switch:*> tokens, always appended at
+    the END of the vocab by resize_token_embeddings) are replaced with rows
+    from a small trainable parameter instead. This way autograd only ever
+    tracks gradients for a [num_new, hidden] tensor, not the full vocab --
+    replaces the old "full matrix trainable + gradient-masking hook"
+    approach, which wasted optimizer memory/time on ~130k unused rows.
+    """
+    def __init__(self, frozen_embedding: nn.Embedding, new_start_idx: int, num_new: int):
+        super().__init__()
+        self.frozen = frozen_embedding
+        for p in self.frozen.parameters():
+            p.requires_grad_(False)
+        self.new_start_idx = new_start_idx
+        # init the new rows from whatever resize_token_embeddings already
+        # put there (mean/cov init), just detached into a small trainable tensor
+        init_rows = self.frozen.weight[new_start_idx:new_start_idx + num_new].detach().clone()
+        self.new_token_embed = nn.Parameter(init_rows)
+
+    def forward(self, input_ids):
+        base = torch.nn.functional.embedding(input_ids, self.frozen.weight)
+        mask = input_ids >= self.new_start_idx
+        if mask.any():
+            local_idx = (input_ids[mask] - self.new_start_idx).long()
+            out = base.clone()
+            out[mask] = self.new_token_embed[local_idx].to(out.dtype)
+            return out
+        return base
+
+
+class _PatchedLMHead(nn.Module):
+    """
+    Same idea for the output projection. Frozen weight computes logits for
+    the original vocab (including the new tokens' garbage placeholder rows,
+    which are simply never used); a small trainable [num_new, hidden]
+    parameter supplies the logits for the new tokens instead, overwriting
+    just the last num_new columns.
+    """
+    def __init__(self, frozen_head: nn.Linear, new_start_idx: int, num_new: int):
+        super().__init__()
+        self.frozen = frozen_head
+        for p in self.frozen.parameters():
+            p.requires_grad_(False)
+        self.new_start_idx = new_start_idx
+        self.num_new = num_new
+        init_rows = self.frozen.weight[new_start_idx:new_start_idx + num_new].detach().clone()
+        self.new_token_head = nn.Parameter(init_rows)  # [num_new, hidden]
+
+    def forward(self, hidden_states):
+        base_logits = torch.nn.functional.linear(hidden_states, self.frozen.weight, self.frozen.bias)
+        new_logits = torch.nn.functional.linear(
+            hidden_states, self.new_token_head.to(hidden_states.dtype)
+        )
+        out = base_logits.clone()
+        out[..., self.new_start_idx:self.new_start_idx + self.num_new] = new_logits
+        return out
 
 
 class FrozenExpert(nn.Module):
@@ -74,7 +137,7 @@ class FrozenExpert(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad_(False)
 
-        # ---- add special tokens, resize, unfreeze only the new rows ----
+        # ---- add special tokens, resize, patch in small trainable params ----
         n_before = len(self.tokenizer)
         new_tokens = switch_cfg.token_strings()
         num_added = self.tokenizer.add_special_tokens(
@@ -82,7 +145,7 @@ class FrozenExpert(nn.Module):
         )
         self.backbone.resize_token_embeddings(len(self.tokenizer))
         self.new_token_ids = list(range(n_before, n_before + num_added))
-        self._register_new_token_grad_mask()
+        self._patch_new_token_params(n_before, num_added)
 
         self.hidden_size = self.backbone.config.hidden_size
         n_layers = getattr(self.backbone.config, "num_hidden_layers",
@@ -99,41 +162,50 @@ class FrozenExpert(nn.Module):
         self.from_shared.to(device=device, dtype=torch.float32)
 
     # ------------------------------------------------------------------
-    # Special-token gradient masking
+    # Special-token params (small, standalone -- NOT the full vocab matrix)
     # ------------------------------------------------------------------
-    def _register_new_token_grad_mask(self):
+    def _patch_new_token_params(self, new_start_idx: int, num_added: int):
         """
-        Unfreeze the embedding + output-head weight matrices, but register a
-        backward hook that zeros the gradient for every row EXCEPT the newly
-        added special-token rows. This lets those new rows learn while never
-        actually updating the pretrained vocabulary's embeddings.
+        Swaps the backbone's input embedding and output head for wrapper
+        modules that keep the pretrained vocab fully frozen and route only
+        the new <switch:*> tokens through small standalone [num_added,
+        hidden] parameters. Registered as nn.Module attributes (self.
+        patched_embedding / self.patched_head) so their params show up
+        automatically via self.parameters() if ever needed, and so they
+        survive .to(device) calls on this FrozenExpert.
+
+        This replaces the old approach of keeping the FULL embedding/head
+        matrices "trainable" behind a gradient-zeroing hook -- that wasted
+        AdamW optimizer memory and per-step update time on ~130k unused
+        rows. Now there are only a few hundred to a couple thousand actual
+        trainable scalars per expert for the special tokens.
         """
-        emb = self.backbone.get_input_embeddings()
-        emb.weight.requires_grad_(True)
-
-        new_ids = set(self.new_token_ids)
-        vocab_size = emb.weight.shape[0]
-        mask = torch.zeros(vocab_size, 1, device=emb.weight.device, dtype=emb.weight.dtype)
-        for i in new_ids:
-            mask[i, 0] = 1.0
-
-        def _mask_grad(grad):
-            return grad * mask.to(grad.dtype)
-        emb.weight.register_hook(_mask_grad)
+        orig_emb = self.backbone.get_input_embeddings()
+        patched_emb = _PatchedEmbedding(orig_emb, new_start_idx, num_added)
+        patched_emb.to(device=orig_emb.weight.device, dtype=orig_emb.weight.dtype)
+        self.backbone.set_input_embeddings(patched_emb)
+        self.patched_embedding = patched_emb
 
         out_emb = self.backbone.get_output_embeddings()
-        if out_emb is not None and out_emb.weight is not emb.weight:
-            out_emb.weight.requires_grad_(True)
-            out_emb.weight.register_hook(_mask_grad)
-        # if tied, the single hook above already covers both
+        self.patched_head = None
+        if out_emb is not None and isinstance(out_emb, nn.Linear):
+            patched_head = _PatchedLMHead(out_emb, new_start_idx, num_added)
+            patched_head.to(device=out_emb.weight.device, dtype=out_emb.weight.dtype)
+            self.backbone.set_output_embeddings(patched_head)
+            self.patched_head = patched_head
+        elif out_emb is not None:
+            print(f"[{self.spec.name}] WARNING: output embeddings module is "
+                  f"{type(out_emb)}, not nn.Linear -- couldn't patch the output "
+                  f"head for new tokens. New-token logits will fall back to "
+                  f"whatever resize_token_embeddings initialized, and won't "
+                  f"be trainable. Generation should still work for non-switch "
+                  f"tokens; investigate if switch tokens never get predicted.")
 
     def trainable_parameters(self):
-        params = [self.to_shared.weight, self.from_shared.weight]
-        emb = self.backbone.get_input_embeddings()
-        params.append(emb.weight)
-        out_emb = self.backbone.get_output_embeddings()
-        if out_emb is not None and out_emb.weight is not emb.weight:
-            params.append(out_emb.weight)
+        params = [self.to_shared.weight, self.from_shared.weight,
+                  self.patched_embedding.new_token_embed]
+        if self.patched_head is not None:
+            params.append(self.patched_head.new_token_head)
         return params
 
     def switch_id(self, target_name: str) -> int:

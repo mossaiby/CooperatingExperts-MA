@@ -60,7 +60,9 @@ def main():
     for e in experts.values():
         e.to_shared.zero_grad()
         e.from_shared.zero_grad()
-        e.backbone.get_input_embeddings().weight.grad = None
+        e.patched_embedding.new_token_embed.grad = None
+        if e.patched_head is not None:
+            e.patched_head.new_token_head.grad = None
 
     print("\n--- Checkpoint save/load round trip ---")
     save_bridge_checkpoint(experts, cfg.stitch.ckpt_dir, "smoke_bridge.pt")

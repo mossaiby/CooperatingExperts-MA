@@ -70,7 +70,7 @@ def directed_loss(experts, batch, align_weight, device):
     return total, lm_loss.item(), (align_src.item() + align_dst.item())
 
 
-def train_stitch(cfg: Config, device="cuda"):
+def train_stitch(cfg: Config, device="cuda", resume_from: str = None):
     os.makedirs(cfg.stitch.ckpt_dir, exist_ok=True)
 
     print("Loading frozen experts ...")
@@ -81,6 +81,21 @@ def train_stitch(cfg: Config, device="cuda"):
     if cfg.stitch.grad_checkpointing:
         for e in experts.values():
             e.gradient_checkpointing_enable()
+
+    start_step = 0
+    if resume_from is not None:
+        load_bridge_checkpoint(experts, resume_from)
+        # step count isn't stored in the checkpoint itself (only bridge
+        # weights are), so infer it from the filename if possible
+        # (model_stitched_step<N>.pt), else just resume from step 0 with
+        # already-trained weights -- optimizer momentum/variance is NOT
+        # preserved across a resume, only the weights are, so expect a
+        # brief lr-warmup-like wobble right after resuming.
+        import re as _re
+        m = _re.search(r"step(\d+)", os.path.basename(resume_from))
+        start_step = int(m.group(1)) if m else 0
+        print(f"Resumed from {resume_from} (inferred start_step={start_step}); "
+              f"note optimizer state is NOT restored, only bridge weights.")
 
     pad_id_by_expert = {name: e.tokenizer.pad_token_id for name, e in experts.items()}
 
@@ -110,7 +125,7 @@ def train_stitch(cfg: Config, device="cuda"):
     train_gen = train_batcher.infinite_pairs()
 
     t0 = time.time()
-    for step in range(cfg.stitch.steps_max):
+    for step in range(start_step, cfg.stitch.steps_max):
         lr = _cosine_warmup_lr(step, cfg.stitch.warmup_steps, cfg.stitch.steps_max, cfg.stitch.lr)
         for g in optimizer.param_groups:
             g["lr"] = lr
@@ -168,23 +183,23 @@ def evaluate(experts, batcher, align_weight, device, n_batches=20):
 
 def save_bridge_checkpoint(experts, ckpt_dir, filename):
     """
-    Only saves the trainable bridge params (to_shared/from_shared + new
-    embedding rows), NOT the frozen backbone weights -- those are re-loaded
-    from the HF hub id at inference time, so checkpoints stay tiny (MBs, not
-    GBs).
+    Only saves the trainable bridge params (to_shared/from_shared + the
+    small new-token embedding/head parameters), NOT the frozen backbone
+    weights -- those are re-loaded from the HF hub id at inference time, so
+    checkpoints stay tiny (KBs-MBs, not GBs).
     """
     state = {}
     for name, e in experts.items():
-        state[name] = {
+        entry = {
             "to_shared": e.to_shared.state_dict(),
             "from_shared": e.from_shared.state_dict(),
-            "new_token_embeddings": {
-                str(i): e.backbone.get_input_embeddings().weight[i].detach().cpu()
-                for i in e.new_token_ids
-            },
+            "new_token_embed": e.patched_embedding.new_token_embed.detach().cpu(),
             "hf_model_id": e.spec.hf_model_id,
             "handoff_layer_index": e.handoff_layer_index,
         }
+        if e.patched_head is not None:
+            entry["new_token_head"] = e.patched_head.new_token_head.detach().cpu()
+        state[name] = entry
     path = os.path.join(ckpt_dir, filename)
     torch.save(state, path)
     print(f"Saved bridge checkpoint -> {path}")
@@ -196,10 +211,12 @@ def load_bridge_checkpoint(experts, path):
         s = state[name]
         e.to_shared.load_state_dict(s["to_shared"])
         e.from_shared.load_state_dict(s["from_shared"])
-        emb_weight = e.backbone.get_input_embeddings().weight
         with torch.no_grad():
-            for i_str, row in s["new_token_embeddings"].items():
-                emb_weight[int(i_str)] = row.to(emb_weight.device, emb_weight.dtype)
+            target = e.patched_embedding.new_token_embed
+            target.copy_(s["new_token_embed"].to(target.device, target.dtype))
+            if e.patched_head is not None and "new_token_head" in s:
+                target_h = e.patched_head.new_token_head
+                target_h.copy_(s["new_token_head"].to(target_h.device, target_h.dtype))
     print(f"Loaded bridge checkpoint from {path}")
 
 
@@ -208,6 +225,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--resume-from", default=None,
+                     help="path to a checkpoint saved by this script "
+                          "(e.g. .../model_stitched_step800.pt) to continue "
+                          "from after a Colab disconnect")
     args = ap.parse_args()
     cfg = Config.debug() if args.debug else Config.default()
-    train_stitch(cfg, device=args.device)
+    train_stitch(cfg, device=args.device, resume_from=args.resume_from)
