@@ -74,13 +74,34 @@ def main():
     mloss.backward()
     print(f"mixed_loss_for_session OK: loss={mloss.item():.4f}")
 
-    print("\n--- Generation smoke test ---")
+    print("\n--- Generation smoke test (natural, no forced switch) ---")
     for e in experts.values():
         e.backbone.eval()
     pieces = generate(experts, "def add(a, b):", "python", cfg, device=device)
     print("Generation pieces:")
     for name, text in pieces:
         print(f"  [{name}] {text[:80]!r}")
+
+    print("\n--- Forced-switch smoke test (exercises the handoff/KV-reseed path) ---")
+    # Untrained bridge weights basically never sample a switch token on
+    # their own, so the natural test above doesn't touch generate.py's
+    # trickiest code: mid-generation handoff + KV-cache reseeding on the
+    # target expert. Force it once here so that path is actually run.
+    from generate import _seed_kv_cache, sample_next_token
+    py = experts["python"]
+    en = experts["english"]
+    prompt_ids = torch.tensor([py.tokenizer("def add(a, b):").input_ids], device=device)
+    _, _ = _seed_kv_cache(py, prompt_ids, injected_vec=None)
+    h = py.encode_handoff_vector(prompt_ids, torch.ones_like(prompt_ids))
+    z = py.to_shared_space(h)
+    h0 = en.from_shared_space(z)
+    anchor_id = torch.tensor([[en.tokenizer.eos_token_id]], device=device)
+    past_kv, logits = _seed_kv_cache(en, anchor_id, injected_vec=h0)
+    next_id = sample_next_token(logits[0], cfg.gen.temperature, cfg.gen.top_k)
+    from generate import _step_with_cache
+    past_kv, logits = _step_with_cache(en, next_id.unsqueeze(0), past_kv)
+    print(f"Forced handoff python->english OK, sampled continuation token id "
+          f"{next_id.item()} ({en.tokenizer.decode([next_id.item()])!r}) with no crash")
 
     print("\nSMOKE TEST PASSED")
 
