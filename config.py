@@ -35,7 +35,7 @@ class ModelPairConfig:
     """
     english: ExpertSpec = field(default_factory=lambda: ExpertSpec(
         name="english",
-        hf_model_id="meta-llama/Llama-3.2-1B",
+        hf_model_id="openbmb/MiniCPM5-1B",
         role="general / English prose",
     ))
     python: ExpertSpec = field(default_factory=lambda: ExpertSpec(
@@ -43,8 +43,15 @@ class ModelPairConfig:
         hf_model_id="deepseek-ai/deepseek-coder-1.3b-base",
         role="Python code",
     ))
-    # Non-gated fallback for the english slot if Llama-3.2 access isn't
-    # approved on your HF account yet:
+    # Not gated, but note MiniCPM5-1B is itself fairly code-capable already
+    # (trained with heavy coding/agentic post-training) -- the "english vs
+    # python" split here is really "general model vs code specialist," not
+    # two domain-pure experts. Fine for testing the mechanics; keep in mind
+    # if you're evaluating how *specialized* each expert's own knowledge is.
+    #
+    # Gated alternative if/when your Llama-3.2-1B access is approved:
+    #   hf_model_id="meta-llama/Llama-3.2-1B"
+    # Non-gated fallback if MiniCPM5 gives trouble:
     #   hf_model_id="google/gemma-2-2b"   (SentencePiece, 256k vocab)
 
 
