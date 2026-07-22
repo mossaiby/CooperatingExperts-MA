@@ -37,7 +37,12 @@ def main():
                      help="Phase-3 checkpoint directories to include")
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-k", type=int, default=50)
-    ap.add_argument("--max-new-tokens", type=int, default=150)
+    ap.add_argument("--max-new-tokens", nargs="*", type=int, default=[150],
+                     help="one or more generation lengths to test per "
+                          "checkpoint -- pass several (e.g. 20 50 100 150) "
+                          "to check whether quality degrades with length "
+                          "(exposure bias / compounding errors) vs. is "
+                          "broken even at short lengths (more structural)")
     ap.add_argument("--seed", type=int, default=0,
                      help="fixed seed so the SAME sampling noise is used "
                           "across checkpoints -- otherwise differences "
@@ -53,7 +58,6 @@ def main():
     cfg = Config.debug() if args.debug else Config.default()
     cfg.gen.temperature = args.temperature
     cfg.gen.top_k = args.top_k
-    cfg.gen.max_new_tokens = args.max_new_tokens
 
     checkpoints = [("bridge", p) for p in args.bridge_ckpts] + \
                   [("lora", p) for p in args.lora_ckpts]
@@ -66,11 +70,13 @@ def main():
             experts = load_experts_for_generation(cfg, lora_ckpt_dir=ckpt_path, device=args.device)
 
         for start_expert, prompt in DEFAULT_PROMPTS:
-            torch.manual_seed(args.seed)  # same noise draw per checkpoint, for a fairer comparison
-            pieces = generate(experts, prompt, start_expert, cfg, device=args.device)
-            print(f"\n--- prompt ({start_expert}): {prompt!r} ---")
-            for name, text in pieces:
-                print(f"  [{name}] {text}")
+            for max_new in args.max_new_tokens:
+                cfg.gen.max_new_tokens = max_new
+                torch.manual_seed(args.seed)  # same noise draw across lengths/checkpoints
+                pieces = generate(experts, prompt, start_expert, cfg, device=args.device)
+                print(f"\n--- prompt ({start_expert}, max_new_tokens={max_new}): {prompt!r} ---")
+                for name, text in pieces:
+                    print(f"  [{name}] {text}")
 
         del experts
         torch.cuda.empty_cache()
