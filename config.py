@@ -79,8 +79,24 @@ class DebugModelPairConfig:
 
 @dataclass
 class SharedSpaceConfig:
-    dim: int = 512          # bottleneck dim; bump vs. the from-scratch v1 (256)
-                             # since pretrained hidden spaces are larger/entangled
+    dim: int = 1024         # bumped from 512 after diagnosis: generation was
+                             # incoherent almost immediately (by ~15 tokens)
+                             # and identically so regardless of length, which
+                             # pointed away from exposure bias/undertraining
+                             # and toward the bottleneck itself being too
+                             # narrow to carry enough content from the source
+                             # expert. This is a cheap-ish test of that
+                             # hypothesis before considering a bigger
+                             # architecture change (e.g. multi-token/
+                             # cross-attention handoff instead of a single
+                             # summary vector).
+                             #
+                             # IMPORTANT: this makes existing checkpoints
+                             # (trained with dim=512) INCOMPATIBLE -- their
+                             # to_shared/from_shared weight shapes won't
+                             # match. Phase 2 and Phase 3 both need to be
+                             # rerun from scratch with this new dim; don't
+                             # try to --resume-from an old checkpoint here.
 
 
 @dataclass
