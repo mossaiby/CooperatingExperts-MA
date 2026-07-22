@@ -191,9 +191,22 @@ if __name__ == "__main__":
     ap.add_argument("--bridge-ckpt", required=True)
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--temperature", type=float, default=None,
+                     help="override cfg.gen.temperature")
+    ap.add_argument("--top-k", type=int, default=None,
+                     help="override cfg.gen.top_k")
+    ap.add_argument("--max-new-tokens", type=int, default=None,
+                     help="override cfg.gen.max_new_tokens")
     args = ap.parse_args()
 
     cfg = Config.debug() if args.debug else Config.default()
+    if args.temperature is not None:
+        cfg.gen.temperature = args.temperature
+    if args.top_k is not None:
+        cfg.gen.top_k = args.top_k
+    if args.max_new_tokens is not None:
+        cfg.gen.max_new_tokens = args.max_new_tokens
+
     experts = load_experts_for_generation(cfg, args.bridge_ckpt, device=args.device)
     pieces = generate(experts, args.prompt, args.expert, cfg, device=args.device)
 
