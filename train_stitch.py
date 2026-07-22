@@ -83,19 +83,31 @@ def train_stitch(cfg: Config, device="cuda", resume_from: str = None):
             e.gradient_checkpointing_enable()
 
     start_step = 0
+    best_val = float("inf")
+    patience_left = cfg.stitch.early_stop_patience
     if resume_from is not None:
-        load_bridge_checkpoint(experts, resume_from)
+        early_stop_state = load_bridge_checkpoint(experts, resume_from)
+        if early_stop_state is not None:
+            best_val = early_stop_state["best_val"]
+            patience_left = early_stop_state["patience_left"]
+            print(f"Restored early-stopping state: best_val={best_val:.4f}, "
+                  f"patience_left={patience_left}")
+        else:
+            print("WARNING: checkpoint has no saved early-stopping state "
+                  "(likely from before this fix, or a --debug/manual save) -- "
+                  "best_val/patience_left restarting fresh. This means "
+                  "early stopping may fire later than it should, or a worse "
+                  "checkpoint could momentarily overwrite 'best' until val "
+                  "loss catches back up to where it actually was.")
         # step count isn't stored in the checkpoint itself (only bridge
-        # weights are), so infer it from the filename if possible
-        # (model_stitched_step<N>.pt), else just resume from step 0 with
-        # already-trained weights -- optimizer momentum/variance is NOT
-        # preserved across a resume, only the weights are, so expect a
-        # brief lr-warmup-like wobble right after resuming.
+        # weights + early-stop state are), so infer it from the filename if
+        # possible (model_stitched_step<N>.pt), else resume from step 0.
         import re as _re
         m = _re.search(r"step(\d+)", os.path.basename(resume_from))
         start_step = int(m.group(1)) if m else 0
         print(f"Resumed from {resume_from} (inferred start_step={start_step}); "
-              f"note optimizer state is NOT restored, only bridge weights.")
+              f"note optimizer state (AdamW momentum/variance) is NOT restored, "
+              f"only bridge weights and early-stop tracking.")
 
     pad_id_by_expert = {name: e.tokenizer.pad_token_id for name, e in experts.items()}
 
@@ -120,8 +132,6 @@ def train_stitch(cfg: Config, device="cuda", resume_from: str = None):
 
     optimizer = AdamW(trainable_params, lr=cfg.stitch.lr, weight_decay=cfg.stitch.weight_decay)
 
-    best_val = float("inf")
-    patience_left = cfg.stitch.early_stop_patience
     train_gen = train_batcher.infinite_pairs()
 
     t0 = time.time()
@@ -155,7 +165,8 @@ def train_stitch(cfg: Config, device="cuda", resume_from: str = None):
             if val_loss < best_val - cfg.stitch.early_stop_min_delta:
                 best_val = val_loss
                 patience_left = cfg.stitch.early_stop_patience
-                save_bridge_checkpoint(experts, cfg.stitch.ckpt_dir, "model_stitched_best.pt")
+                save_bridge_checkpoint(experts, cfg.stitch.ckpt_dir, "model_stitched_best.pt",
+                                        best_val=best_val, patience_left=patience_left)
             else:
                 patience_left -= 1
                 if patience_left <= 0:
@@ -163,9 +174,11 @@ def train_stitch(cfg: Config, device="cuda", resume_from: str = None):
                     break
 
         if step > 0 and step % cfg.stitch.ckpt_every == 0:
-            save_bridge_checkpoint(experts, cfg.stitch.ckpt_dir, f"model_stitched_step{step}.pt")
+            save_bridge_checkpoint(experts, cfg.stitch.ckpt_dir, f"model_stitched_step{step}.pt",
+                                    best_val=best_val, patience_left=patience_left)
 
-    save_bridge_checkpoint(experts, cfg.stitch.ckpt_dir, "model_stitched_final.pt")
+    save_bridge_checkpoint(experts, cfg.stitch.ckpt_dir, "model_stitched_final.pt",
+                            best_val=best_val, patience_left=patience_left)
     return experts
 
 
@@ -181,12 +194,16 @@ def evaluate(experts, batcher, align_weight, device, n_batches=20):
     return total_lm / (2 * n_batches)
 
 
-def save_bridge_checkpoint(experts, ckpt_dir, filename):
+def save_bridge_checkpoint(experts, ckpt_dir, filename, best_val=None, patience_left=None):
     """
     Only saves the trainable bridge params (to_shared/from_shared + the
     small new-token embedding/head parameters), NOT the frozen backbone
     weights -- those are re-loaded from the HF hub id at inference time, so
     checkpoints stay tiny (KBs-MBs, not GBs).
+
+    Also stores best_val/patience_left under a top-level "_early_stop" key
+    so a --resume-from run doesn't lose track of the best score seen so
+    far or reset the early-stopping countdown.
     """
     state = {}
     for name, e in experts.items():
@@ -200,6 +217,8 @@ def save_bridge_checkpoint(experts, ckpt_dir, filename):
         if e.patched_head is not None:
             entry["new_token_head"] = e.patched_head.new_token_head.detach().cpu()
         state[name] = entry
+    if best_val is not None:
+        state["_early_stop"] = {"best_val": best_val, "patience_left": patience_left}
     path = os.path.join(ckpt_dir, filename)
     torch.save(state, path)
     print(f"Saved bridge checkpoint -> {path}")
@@ -218,6 +237,7 @@ def load_bridge_checkpoint(experts, path):
                 target_h = e.patched_head.new_token_head
                 target_h.copy_(s["new_token_head"].to(target_h.device, target_h.dtype))
     print(f"Loaded bridge checkpoint from {path}")
+    return state.get("_early_stop")  # None for old-format / non-training checkpoints
 
 
 if __name__ == "__main__":
