@@ -16,6 +16,8 @@ continue normally with input_ids + KV cache" -- so this is a manual loop:
 This is the piece that changes the most vs. v1's from-scratch Expert.forward,
 since HF models don't expose the same low-level hooks your own nn.Module did.
 """
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -172,12 +174,31 @@ def generate(experts, prompt_text, start_expert, cfg, device="cuda"):
     return output_pieces
 
 
-def load_experts_for_generation(cfg: Config, bridge_ckpt_path: str, device="cuda"):
+def load_experts_for_generation(cfg: Config, bridge_ckpt_path: str = None,
+                                  lora_ckpt_dir: str = None, device="cuda"):
+    """
+    Loads experts either from a Phase-2-only bridge checkpoint (a single
+    .pt file, no LoRA), or from a Phase-3 checkpoint directory (as saved by
+    train_lora.save_lora_checkpoint: contains english_lora/, python_lora/,
+    and bridge.pt). Pass exactly one of bridge_ckpt_path / lora_ckpt_dir.
+    """
+    if (bridge_ckpt_path is None) == (lora_ckpt_dir is None):
+        raise ValueError("pass exactly one of bridge_ckpt_path or lora_ckpt_dir")
+
     experts = {
         "english": FrozenExpert(cfg.pair.english, cfg.shared, cfg.switch, cfg.handoff_layer, device),
         "python": FrozenExpert(cfg.pair.python, cfg.shared, cfg.switch, cfg.handoff_layer, device),
     }
-    load_bridge_checkpoint(experts, bridge_ckpt_path)
+
+    if lora_ckpt_dir is not None:
+        from train_lora import attach_lora_from_checkpoint
+        print(f"Loading Phase-3 (LoRA) checkpoint from {lora_ckpt_dir} ...")
+        for name, e in experts.items():
+            attach_lora_from_checkpoint(e, os.path.join(lora_ckpt_dir, f"{name}_lora"))
+        load_bridge_checkpoint(experts, os.path.join(lora_ckpt_dir, "bridge.pt"))
+    else:
+        load_bridge_checkpoint(experts, bridge_ckpt_path)
+
     for e in experts.values():
         e.backbone.eval()
     return experts
@@ -188,7 +209,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("prompt", type=str)
     ap.add_argument("--expert", choices=["english", "python"], default="english")
-    ap.add_argument("--bridge-ckpt", required=True)
+    ap.add_argument("--bridge-ckpt", default=None,
+                     help="Phase-2-only checkpoint (single .pt file, no LoRA)")
+    ap.add_argument("--lora-ckpt", default=None,
+                     help="Phase-3 checkpoint directory, e.g. checkpoints/lora_best "
+                          "(mutually exclusive with --bridge-ckpt)")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--temperature", type=float, default=None,
@@ -198,6 +223,8 @@ if __name__ == "__main__":
     ap.add_argument("--max-new-tokens", type=int, default=None,
                      help="override cfg.gen.max_new_tokens")
     args = ap.parse_args()
+    if (args.bridge_ckpt is None) == (args.lora_ckpt is None):
+        ap.error("pass exactly one of --bridge-ckpt or --lora-ckpt")
 
     cfg = Config.debug() if args.debug else Config.default()
     if args.temperature is not None:
@@ -207,7 +234,10 @@ if __name__ == "__main__":
     if args.max_new_tokens is not None:
         cfg.gen.max_new_tokens = args.max_new_tokens
 
-    experts = load_experts_for_generation(cfg, args.bridge_ckpt, device=args.device)
+    experts = load_experts_for_generation(
+        cfg, bridge_ckpt_path=args.bridge_ckpt, lora_ckpt_dir=args.lora_ckpt,
+        device=args.device,
+    )
     pieces = generate(experts, args.prompt, args.expert, cfg, device=args.device)
 
     print("\n=== Generated (with switches) ===")
