@@ -172,6 +172,8 @@ class GenConfig:
     temperature: float = 0.8
     top_k: int = 50
     max_switches: int = 4
+    repetition_penalty: float = 1.3
+    no_repeat_ngram_size: int = 3
 
 
 @dataclass

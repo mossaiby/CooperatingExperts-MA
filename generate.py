@@ -24,7 +24,46 @@ from models import FrozenExpert
 from train_stitch import load_bridge_checkpoint
 
 
-def sample_next_token(logits, temperature, top_k):
+def sample_next_token(logits, temperature, top_k, generated_ids=None,
+                       repetition_penalty=1.3, no_repeat_ngram_size=3):
+    """
+    Standard decoding-quality guards on top of temperature/top-k sampling --
+    small models (1-3B) are prone to falling into repetition loops on longer
+    generations without these.
+
+    repetition_penalty: divides (if logit>0) or multiplies (if logit<=0) the
+        logits of any token already seen in generated_ids, discouraging
+        the model from just repeating itself. Standard trick from Keskar
+        et al. 2019 / used by HF's own generate().
+    no_repeat_ngram_size: if the last (n-1) tokens plus a candidate token
+        would recreate an n-gram that's already appeared in generated_ids,
+        that candidate is banned outright (hard -inf), not just penalized --
+        this is what actually breaks exact-repeat loops like the
+        factorial/fibo cycling seen in practice, since a soft penalty alone
+        often isn't enough to stop a model from re-entering a loop it's
+        already committed to.
+    """
+    logits = logits.clone()
+
+    if generated_ids is not None and len(generated_ids) > 0 and repetition_penalty != 1.0:
+        seen = set(generated_ids)
+        for tok_id in seen:
+            if logits[tok_id] > 0:
+                logits[tok_id] /= repetition_penalty
+            else:
+                logits[tok_id] *= repetition_penalty
+
+    if generated_ids is not None and no_repeat_ngram_size > 0 and \
+            len(generated_ids) >= no_repeat_ngram_size - 1:
+        n = no_repeat_ngram_size
+        prefix = tuple(generated_ids[-(n - 1):]) if n > 1 else tuple()
+        seen_ngrams = set()
+        for i in range(len(generated_ids) - n + 1):
+            seen_ngrams.add(tuple(generated_ids[i:i + n]))
+        banned_next = {ng[-1] for ng in seen_ngrams if ng[:-1] == prefix}
+        for tok_id in banned_next:
+            logits[tok_id] = float("-inf")
+
     logits = logits / max(temperature, 1e-5)
     if top_k > 0:
         top_vals, top_idx = torch.topk(logits, top_k)
@@ -78,7 +117,10 @@ def generate(experts, prompt_text, start_expert, cfg, device="cuda"):
     n_switches = 0
 
     for _ in range(gen_cfg.max_new_tokens):
-        next_id = sample_next_token(logits[0], gen_cfg.temperature, gen_cfg.top_k)
+        next_id = sample_next_token(logits[0], gen_cfg.temperature, gen_cfg.top_k,
+                                     generated_ids=active_context_ids,
+                                     repetition_penalty=gen_cfg.repetition_penalty,
+                                     no_repeat_ngram_size=gen_cfg.no_repeat_ngram_size)
         next_id_batched = next_id.unsqueeze(0)
 
         # is this a switch token, and does it name a DIFFERENT expert?
