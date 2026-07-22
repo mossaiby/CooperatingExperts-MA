@@ -76,6 +76,37 @@ def main():
     mloss.backward()
     print(f"mixed_loss_for_session OK: loss={mloss.item():.4f}")
 
+    print("\n--- Multi-vector handoff shape check (encode_handoff_vectors + injected-prefix) ---")
+    K = 4
+    en2py_batch2, _ = next(batcher.infinite_pairs())
+    src = experts[en2py_batch2["src"]]
+    dst = experts[en2py_batch2["dst"]]
+    prefix_ids = en2py_batch2["prefix_ids"].to(device)
+    prefix_mask = en2py_batch2["prefix_mask"].to(device)
+    cont_ids = en2py_batch2["cont_ids"].to(device)
+    cont_mask = en2py_batch2["cont_mask"].to(device)
+    h_src_multi = src.encode_handoff_vectors(prefix_ids, prefix_mask, num_vectors=K)
+    assert h_src_multi.shape == (prefix_ids.shape[0], K, src.hidden_size), \
+        f"unexpected shape {h_src_multi.shape}"
+    z_multi = src.to_shared_space(h_src_multi)
+    assert z_multi.shape == (prefix_ids.shape[0], K, cfg.shared.dim)
+    h0_multi = dst.from_shared_space(z_multi)
+    assert h0_multi.shape == (prefix_ids.shape[0], K, dst.hidden_size)
+    logits_multi = dst.forward_with_injected_prefix(h0_multi, cont_ids, cont_mask)
+    assert logits_multi.shape[:2] == cont_ids.shape, \
+        f"logits shape {logits_multi.shape} doesn't align with cont_ids {cont_ids.shape}"
+    loss_multi = torch.nn.functional.cross_entropy(
+        logits_multi.reshape(-1, logits_multi.shape[-1]).float(), cont_ids.reshape(-1)
+    )
+    loss_multi.backward()
+    print(f"multi-vector (K={K}) shapes OK, loss={loss_multi.item():.4f}")
+    for e in experts.values():
+        e.to_shared.zero_grad()
+        e.from_shared.zero_grad()
+        e.patched_embedding.new_token_embed.grad = None
+        if e.patched_head is not None:
+            e.patched_head.new_token_head.grad = None
+
     print("\n--- Generation smoke test (natural, no forced switch) ---")
     for e in experts.values():
         e.backbone.eval()

@@ -37,7 +37,7 @@ def _cosine_warmup_lr(step, warmup_steps, total_steps, base_lr):
     return 0.5 * base_lr * (1 + math.cos(math.pi * min(progress, 1.0)))
 
 
-def directed_loss(experts, batch, align_weight, device):
+def directed_loss(experts, batch, align_weight, device, num_vectors=1):
     src = experts[batch["src"]]
     dst = experts[batch["dst"]]
 
@@ -46,9 +46,12 @@ def directed_loss(experts, batch, align_weight, device):
     cont_ids = batch["cont_ids"].to(device)
     cont_mask = batch["cont_mask"].to(device)
 
-    h_src = src.encode_handoff_vector(prefix_ids, prefix_mask)  # [B, H_src], float32
-    z = src.to_shared_space(h_src)                              # [B, shared_dim]
-    h0 = dst.from_shared_space(z)                               # [B, H_dst]
+    if num_vectors > 1:
+        h_src = src.encode_handoff_vectors(prefix_ids, prefix_mask, num_vectors)  # [B, K, H_src]
+    else:
+        h_src = src.encode_handoff_vector(prefix_ids, prefix_mask)  # [B, H_src]
+    z = src.to_shared_space(h_src)                              # [B, (K,) shared_dim]
+    h0 = dst.from_shared_space(z)                               # [B, (K,) H_dst]
 
     logits = dst.forward_with_injected_prefix(h0, cont_ids, cont_mask)  # [B, T, V]
 
@@ -62,7 +65,10 @@ def directed_loss(experts, batch, align_weight, device):
     )
 
     # alignment regularizer on both experts' own round-trip
-    h_dst = dst.encode_handoff_vector(cont_ids, cont_mask)
+    if num_vectors > 1:
+        h_dst = dst.encode_handoff_vectors(cont_ids, cont_mask, num_vectors)
+    else:
+        h_dst = dst.encode_handoff_vector(cont_ids, cont_mask)
     align_src = F.mse_loss(src.from_shared_space(src.to_shared_space(h_src)).float(), h_src)
     align_dst = F.mse_loss(dst.from_shared_space(dst.to_shared_space(h_dst)).float(), h_dst)
 
@@ -145,7 +151,8 @@ def train_stitch(cfg: Config, device="cuda", resume_from: str = None):
         for _ in range(cfg.stitch.grad_accum):
             en2py_batch, py2en_batch = next(train_gen)
             for batch in (en2py_batch, py2en_batch):
-                loss, lm_l, align_l = directed_loss(experts, batch, cfg.stitch.align_weight, device)
+                loss, lm_l, align_l = directed_loss(experts, batch, cfg.stitch.align_weight, device,
+                                                      num_vectors=cfg.shared.num_vectors)
                 (loss / (2 * cfg.stitch.grad_accum)).backward()
                 step_lm_loss += lm_l / (2 * cfg.stitch.grad_accum)
                 step_align_loss += align_l / (2 * cfg.stitch.grad_accum)
@@ -160,7 +167,8 @@ def train_stitch(cfg: Config, device="cuda", resume_from: str = None):
                   f"({elapsed:.0f}s elapsed)")
 
         if step > 0 and step % cfg.stitch.val_every == 0:
-            val_loss = evaluate(experts, val_batcher, cfg.stitch.align_weight, device, n_batches=20)
+            val_loss = evaluate(experts, val_batcher, cfg.stitch.align_weight, device, n_batches=20,
+                                 num_vectors=cfg.shared.num_vectors)
             print(f"[stitch] step {step:5d} VAL lm_loss={val_loss:.4f}")
             if val_loss < best_val - cfg.stitch.early_stop_min_delta:
                 best_val = val_loss
@@ -183,13 +191,13 @@ def train_stitch(cfg: Config, device="cuda", resume_from: str = None):
 
 
 @torch.no_grad()
-def evaluate(experts, batcher, align_weight, device, n_batches=20):
+def evaluate(experts, batcher, align_weight, device, n_batches=20, num_vectors=1):
     total_lm = 0.0
     gen = batcher.infinite_pairs()
     for _ in range(n_batches):
         en2py_batch, py2en_batch = next(gen)
         for batch in (en2py_batch, py2en_batch):
-            _, lm_l, _ = directed_loss(experts, batch, align_weight, device)
+            _, lm_l, _ = directed_loss(experts, batch, align_weight, device, num_vectors=num_vectors)
             total_lm += lm_l
     return total_lm / (2 * n_batches)
 
@@ -249,6 +257,20 @@ if __name__ == "__main__":
                      help="path to a checkpoint saved by this script "
                           "(e.g. .../model_stitched_step800.pt) to continue "
                           "from after a Colab disconnect")
+    ap.add_argument("--dim", type=int, default=None,
+                     help="override cfg.shared.dim")
+    ap.add_argument("--num-vectors", type=int, default=None,
+                     help="override cfg.shared.num_vectors (>1 enables the "
+                          "multi-vector handoff instead of a single summary "
+                          "vector)")
+    ap.add_argument("--ckpt-dir", default=None,
+                     help="override cfg.stitch.ckpt_dir")
     args = ap.parse_args()
     cfg = Config.debug() if args.debug else Config.default()
+    if args.dim is not None:
+        cfg.shared.dim = args.dim
+    if args.num_vectors is not None:
+        cfg.shared.num_vectors = args.num_vectors
+    if args.ckpt_dir is not None:
+        cfg.stitch.ckpt_dir = args.ckpt_dir
     train_stitch(cfg, device=args.device, resume_from=args.resume_from)

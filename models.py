@@ -224,6 +224,9 @@ class FrozenExpert(nn.Module):
         Run the backbone on input_ids, return the hidden state at
         self.handoff_layer_index for the LAST real token of each sequence.
         Shape: [B, hidden_size], dtype float32.
+
+        This is the original single-vector path (num_vectors=1 case).
+        See encode_handoff_vectors() for the multi-vector variant.
         """
         out = self.backbone(
             input_ids=input_ids,
@@ -239,6 +242,55 @@ class FrozenExpert(nn.Module):
         last_hidden = hs[batch_idx, last_idx.long()]  # [B, H]
         return last_hidden.float()
 
+    def encode_handoff_vectors(self, input_ids, attention_mask, num_vectors):
+        """
+        Multi-vector variant: instead of pooling the whole segment down to
+        ONE summary vector, keep the hidden states of the last `num_vectors`
+        REAL (non-padding) tokens at self.handoff_layer_index, per sequence.
+        Shape: [B, num_vectors, hidden_size], dtype float32.
+
+        Rationale: a single vector discards positional/sequential structure
+        (e.g. "the recursive call is factorial(n-1), in that order" vs. just
+        "this is about factorial and recursion"). Keeping a short SEQUENCE
+        of vectors instead of one lets from_shared_space's injected prefix
+        carry some of that structure into the target expert, at the cost of
+        a slightly larger prefix (num_vectors positions instead of 1).
+
+        If a sequence has fewer than num_vectors real tokens, the earliest
+        slots are padded by repeating the first real token's hidden state
+        (rather than zeros) so the target always sees num_vectors
+        "meaningful" positions, not an artificial zero-vector signal that
+        the target has never seen during its own pretraining.
+        """
+        out = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+        hs = out.hidden_states[self.handoff_layer_index]  # [B, T, H]
+        B, T, H = hs.shape
+        device = hs.device
+
+        if attention_mask is not None:
+            lengths = attention_mask.sum(dim=1).long()  # [B], real token count per seq
+        else:
+            lengths = torch.full((B,), T, device=device, dtype=torch.long)
+
+        out_vecs = torch.zeros(B, num_vectors, H, device=device, dtype=hs.dtype)
+        for b in range(B):
+            L = max(int(lengths[b].item()), 1)
+            take = min(num_vectors, L)
+            # last `take` real tokens, in order
+            selected = hs[b, L - take:L, :]  # [take, H]
+            if take < num_vectors:
+                # pad earliest slots by repeating the first available token,
+                # so every batch row has exactly num_vectors positions
+                pad = selected[0:1, :].expand(num_vectors - take, H)
+                selected = torch.cat([pad, selected], dim=0)
+            out_vecs[b] = selected
+
+        return out_vecs.float()  # [B, num_vectors, H]
+
     def to_shared_space(self, h):
         return self.to_shared(h.float())
 
@@ -248,16 +300,27 @@ class FrozenExpert(nn.Module):
     def forward_with_injected_prefix(self, injected_vec, input_ids, attention_mask=None,
                                       labels=None):
         """
-        Prepend `injected_vec` ([B, H]) as a virtual position 0 via
-        inputs_embeds, then run the normal token embeddings for input_ids,
-        concatenated after it. Returns logits over input_ids positions only
-        (i.e. the prepended position is stripped from the loss/logits, it
-        only serves to condition the rest of the forward pass).
+        Prepend `injected_vec` as a virtual prefix via inputs_embeds, then
+        run the normal token embeddings for input_ids, concatenated after
+        it. Returns logits over input_ids positions only.
+
+        injected_vec can be EITHER:
+          - [B, H]      (single-vector handoff, num_vectors=1) -- treated
+                        as one virtual position, matching the original
+                        behavior exactly.
+          - [B, K, H]   (multi-vector handoff, num_vectors=K) -- treated as
+                        K virtual positions.
         """
         emb_layer = self.backbone.get_input_embeddings()
         tok_embeds = emb_layer(input_ids)  # [B, T, H]
-        injected = injected_vec.unsqueeze(1).to(tok_embeds.dtype)  # [B, 1, H]
-        full_embeds = torch.cat([injected, tok_embeds], dim=1)  # [B, T+1, H]
+
+        if injected_vec.dim() == 2:
+            injected = injected_vec.unsqueeze(1).to(tok_embeds.dtype)  # [B, 1, H]
+        else:
+            injected = injected_vec.to(tok_embeds.dtype)  # [B, K, H]
+        n_injected = injected.shape[1]
+
+        full_embeds = torch.cat([injected, tok_embeds], dim=1)  # [B, K+T, H]
 
         if attention_mask is not None:
             extra = torch.ones(attention_mask.shape[0], 1,
@@ -267,17 +330,15 @@ class FrozenExpert(nn.Module):
             full_mask = None
 
         out = self.backbone(inputs_embeds=full_embeds, attention_mask=full_mask)
-        # full_embeds = [injected, tok_0, tok_1, ..., tok_{T-1}]  (T+1 positions)
-        # out.logits[:, i, :] is the model's prediction for the token that
-        # comes AFTER position i. So:
-        #   out.logits[:, 0, :] predicts tok_0        == input_ids[:, 0]
-        #   out.logits[:, 1, :] predicts tok_1        == input_ids[:, 1]
-        #   ...
-        #   out.logits[:, T-1, :] predicts tok_{T-1}  == input_ids[:, T-1]
-        # i.e. dropping the LAST position (which predicts one step beyond the
-        # sequence) lines logits up 1:1 with input_ids, no further shift
-        # needed by the caller.
-        logits = out.logits[:, :-1, :]
+        # full_embeds = [inj_0, ..., inj_{K-1}, tok_0, tok_1, ..., tok_{T-1}]
+        # (K+T positions, K = n_injected). out.logits[:, i, :] predicts the
+        # token that comes AFTER position i. input_ids[:, j] sits at
+        # position K+j in full_embeds, so its prediction comes from
+        # out.logits[:, K+j-1, :]. Sliding that over j=0..T-1 gives the
+        # window out.logits[:, K-1 : K-1+T, :] == out.logits[:, K-1:-1, :],
+        # which lines up 1:1 with input_ids with no further shift needed.
+        # (K=1 reduces to the original out.logits[:, :-1, :] behavior.)
+        logits = out.logits[:, n_injected - 1:-1, :]
         return logits
 
     def gradient_checkpointing_enable(self):

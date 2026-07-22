@@ -60,14 +60,14 @@ def attach_lora_from_checkpoint(expert: FrozenExpert, adapter_dir: str):
 
 
 @torch.no_grad()
-def evaluate_mixed(val_sessions, experts, device, switch_loss_weight, n_sessions=20):
+def evaluate_mixed(val_sessions, experts, device, switch_loss_weight, n_sessions=20, num_vectors=1):
     import random
     rng = random.Random(0)
     total = 0.0
     sample = rng.sample(val_sessions, min(n_sessions, len(val_sessions)))
     for session in sample:
         chunks = encode_session(session, experts, max_seq_len=256)
-        loss = mixed_loss_for_session(chunks, experts, device, switch_loss_weight)
+        loss = mixed_loss_for_session(chunks, experts, device, switch_loss_weight, num_vectors=num_vectors)
         total += loss.item()
     return total / len(sample)
 
@@ -108,17 +108,18 @@ def encode_session(session, experts, max_seq_len):
     return chunks
 
 
-def mixed_loss_for_session(chunks, experts, device, switch_loss_weight):
+def mixed_loss_for_session(chunks, experts, device, switch_loss_weight, num_vectors=1):
     """
     Walks the session segment by segment. For segment i>0, the carried
-    hidden state is produced by encoding segment i-1 with ITS expert and
-    projecting through the shared space into segment i's expert -- exactly
-    the Phase-2 handoff mechanism, now with LoRA-adapted (not fully frozen)
-    backbones. Loss is accumulated per segment and averaged.
+    hidden state (or, if num_vectors>1, short sequence of hidden states) is
+    produced by encoding segment i-1 with ITS expert and projecting through
+    the shared space into segment i's expert -- exactly the Phase-2 handoff
+    mechanism, now with LoRA-adapted (not fully frozen) backbones. Loss is
+    accumulated per segment and averaged.
     """
     total_loss = 0.0
     n = 0
-    carried_vec = None  # [1, H_dst] once we have one
+    carried_vec = None  # [1, H_dst] (num_vectors=1) or [1, K, H_dst] once we have one
 
     for i, chunk in enumerate(chunks):
         e = experts[chunk["expert"]]
@@ -140,10 +141,13 @@ def mixed_loss_for_session(chunks, experts, device, switch_loss_weight):
 
         # prepare handoff vector for the NEXT segment (if any)
         if i < len(chunks) - 1:
-            h = e.encode_handoff_vector(ids, mask)         # [1, H_src]
-            z = e.to_shared_space(h)                        # [1, shared_dim]
+            if num_vectors > 1:
+                h = e.encode_handoff_vectors(ids, mask, num_vectors)  # [1, K, H_src]
+            else:
+                h = e.encode_handoff_vector(ids, mask)         # [1, H_src]
+            z = e.to_shared_space(h)                        # [1, (K,) shared_dim]
             next_expert = experts[chunks[i + 1]["expert"]]
-            carried_vec = next_expert.from_shared_space(z)   # [1, H_dst]
+            carried_vec = next_expert.from_shared_space(z)   # [1, (K,) H_dst]
 
     return total_loss / max(1, n)
 
@@ -206,7 +210,8 @@ def train_lora(cfg: Config, bridge_ckpt_path: str, device="cuda", resume_from: s
         for _ in range(cfg.lora.grad_accum):
             session = rng.choice(train_sessions)
             chunks = encode_session(session, experts, max_seq_len=256)
-            loss = mixed_loss_for_session(chunks, experts, device, cfg.lora.switch_loss_weight)
+            loss = mixed_loss_for_session(chunks, experts, device, cfg.lora.switch_loss_weight,
+                                           num_vectors=cfg.shared.num_vectors)
             (loss / cfg.lora.grad_accum).backward()
             step_loss += loss.item() / cfg.lora.grad_accum
 
@@ -219,7 +224,8 @@ def train_lora(cfg: Config, bridge_ckpt_path: str, device="cuda", resume_from: s
                   f"loss={step_loss:.4f} ({elapsed:.0f}s elapsed)")
 
         if step > 0 and step % cfg.lora.ckpt_every == 0:
-            val_loss = evaluate_mixed(val_sessions, experts, device, cfg.lora.switch_loss_weight)
+            val_loss = evaluate_mixed(val_sessions, experts, device, cfg.lora.switch_loss_weight,
+                                       num_vectors=cfg.shared.num_vectors)
             print(f"[lora] step {step:5d} VAL loss={val_loss:.4f}")
             save_lora_checkpoint(experts, cfg.lora.ckpt_dir, f"lora_step{step}")
             if val_loss < best_val:

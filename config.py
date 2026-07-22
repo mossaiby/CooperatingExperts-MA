@@ -35,7 +35,7 @@ class ModelPairConfig:
     """
     english: ExpertSpec = field(default_factory=lambda: ExpertSpec(
         name="english",
-        hf_model_id="openbmb/MiniCPM5-1B",
+        hf_model_id="meta-llama/Llama-3.2-1B",
         role="general / English prose",
     ))
     python: ExpertSpec = field(default_factory=lambda: ExpertSpec(
@@ -43,16 +43,24 @@ class ModelPairConfig:
         hf_model_id="deepseek-ai/deepseek-coder-1.3b-base",
         role="Python code",
     ))
-    # Not gated, but note MiniCPM5-1B is itself fairly code-capable already
-    # (trained with heavy coding/agentic post-training) -- the "english vs
-    # python" split here is really "general model vs code specialist," not
-    # two domain-pure experts. Fine for testing the mechanics; keep in mind
-    # if you're evaluating how *specialized* each expert's own knowledge is.
+    # Swapped from openbmb/MiniCPM5-1B once Llama-3.2-1B access was granted.
+    # MiniCPM5-1B is heavily post-trained for code/agentic tasks, which
+    # blurred the "English vs Python expert" domain separation the whole
+    # project is testing -- the English expert already knew a lot of Python
+    # going in. Llama-3.2-1B-base is a more general-purpose, less
+    # code-specialized, and far more established base model. Its own
+    # base-model-quality check (check_base_model_quality.py) should be
+    # rerun after this swap -- MiniCPM5's baseline was already established,
+    # Llama-3.2-1B's hasn't been.
     #
-    # Gated alternative if/when your Llama-3.2-1B access is approved:
-    #   hf_model_id="meta-llama/Llama-3.2-1B"
-    # Non-gated fallback if MiniCPM5 gives trouble:
-    #   hf_model_id="google/gemma-2-2b"   (SentencePiece, 256k vocab)
+    # IMPORTANT: rerun check_tokenizer_overlap.py after this swap. Llama's
+    # tokenizer is a different BPE than MiniCPM5's, so the overlap numbers
+    # from the earlier check no longer apply and need to be re-verified
+    # against deepseek-coder-1.3b-base specifically.
+    #
+    # Non-gated fallback if Llama-3.2-1B access issues resurface:
+    #   hf_model_id="openbmb/MiniCPM5-1B"
+    #   hf_model_id="google/gemma-2-2b"
 
 
 @dataclass
@@ -97,6 +105,22 @@ class SharedSpaceConfig:
                              # match. Phase 2 and Phase 3 both need to be
                              # rerun from scratch with this new dim; don't
                              # try to --resume-from an old checkpoint here.
+    num_vectors: int = 1    # 1 = original single-summary-vector handoff.
+                             # >1 = keep the last num_vectors token hidden
+                             # states (instead of pooling to one) and inject
+                             # all of them as a short virtual prefix. This
+                             # preserves some positional/sequential
+                             # structure that a single vector necessarily
+                             # discards -- worth trying if dim alone (going
+                             # 512->1024) doesn't fix the incoherence, since
+                             # the failure mode observed (wrong almost
+                             # immediately, not length-dependent) looks more
+                             # like "wrong kind of representation" than
+                             # "not enough raw capacity."
+                             # NOTE: changing this also breaks checkpoint
+                             # compatibility (to_shared/from_shared are the
+                             # same Linear either way, but how many times
+                             # they're applied per handoff changes).
 
 
 @dataclass
@@ -222,4 +246,12 @@ class Config:
         cfg.stitch.max_seq_len = 64
         cfg.lora.steps_max = 40
         cfg.lora.grad_accum = 2
+        return cfg
+
+    @staticmethod
+    def debug_multivector():
+        """Tiny-model config with multi-vector handoff enabled, for smoke
+        testing that path before spending real GPU time on it."""
+        cfg = Config.debug()
+        cfg.shared.num_vectors = 4
         return cfg

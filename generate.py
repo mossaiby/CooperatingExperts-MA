@@ -82,11 +82,18 @@ def _seed_kv_cache(expert: FrozenExpert, prompt_ids, injected_vec=None):
     prompt (optionally prefixed by an injected handoff vector via
     inputs_embeds). last_logits is the distribution for the NEXT token
     after the prompt.
+
+    injected_vec can be [B, H] (single-vector handoff -> unsqueezed to one
+    virtual position) or [B, K, H] (multi-vector handoff -> K virtual
+    positions), matching FrozenExpert.forward_with_injected_prefix.
     """
     emb_layer = expert.backbone.get_input_embeddings()
     tok_embeds = emb_layer(prompt_ids)  # [1, T, H]
     if injected_vec is not None:
-        injected = injected_vec.unsqueeze(1).to(tok_embeds.dtype)
+        if injected_vec.dim() == 2:
+            injected = injected_vec.unsqueeze(1).to(tok_embeds.dtype)  # [1, 1, H]
+        else:
+            injected = injected_vec.to(tok_embeds.dtype)  # [1, K, H]
         full_embeds = torch.cat([injected, tok_embeds], dim=1)
     else:
         full_embeds = tok_embeds
@@ -140,10 +147,14 @@ def generate(experts, prompt_text, start_expert, cfg, device="cuda"):
                 output_pieces.append((active_name, text))
                 current_piece_ids = []
 
-            # compute handoff vector from the ACTIVE expert's full context
+            # compute handoff vector(s) from the ACTIVE expert's full context
             # since it became active (not just tokens since the last flush)
             context_ids = torch.tensor([active_context_ids], device=device)
-            h = active.encode_handoff_vector(context_ids, torch.ones_like(context_ids))
+            context_mask = torch.ones_like(context_ids)
+            if cfg.shared.num_vectors > 1:
+                h = active.encode_handoff_vectors(context_ids, context_mask, cfg.shared.num_vectors)
+            else:
+                h = active.encode_handoff_vector(context_ids, context_mask)
             z = active.to_shared_space(h)
 
             target = experts[target_name]
