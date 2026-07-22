@@ -161,9 +161,9 @@ class LoraTrainConfig:
     warmup_steps: int = 100
     grad_clip: float = 0.5
     switch_loss_weight: float = 0.1
-    log_every: int = 20
+    log_every: int = 5
     ckpt_dir: str = "checkpoints"
-    ckpt_every: int = 200
+    ckpt_every: int = 20           # frequent -- Phase 2 taught us sessions can die early
 
 
 @dataclass

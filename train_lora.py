@@ -51,6 +51,27 @@ def attach_lora(expert: FrozenExpert, lora_cfg):
     return expert
 
 
+def attach_lora_from_checkpoint(expert: FrozenExpert, adapter_dir: str):
+    """Loads a previously-saved LoRA adapter (from save_lora_checkpoint) in
+    trainable mode, for resuming a Phase-3 run after a disconnect."""
+    expert.backbone = PeftModel.from_pretrained(expert.backbone, adapter_dir, is_trainable=True)
+    expert.backbone.print_trainable_parameters()
+    return expert
+
+
+@torch.no_grad()
+def evaluate_mixed(val_sessions, experts, device, switch_loss_weight, n_sessions=20):
+    import random
+    rng = random.Random(0)
+    total = 0.0
+    sample = rng.sample(val_sessions, min(n_sessions, len(val_sessions)))
+    for session in sample:
+        chunks = encode_session(session, experts, max_seq_len=256)
+        loss = mixed_loss_for_session(chunks, experts, device, switch_loss_weight)
+        total += loss.item()
+    return total / len(sample)
+
+
 def build_sessions(pairs, seed=0):
     import random
     rng = random.Random(seed)
@@ -127,7 +148,7 @@ def mixed_loss_for_session(chunks, experts, device, switch_loss_weight):
     return total_loss / max(1, n)
 
 
-def train_lora(cfg: Config, bridge_ckpt_path: str, device="cuda"):
+def train_lora(cfg: Config, bridge_ckpt_path: str, device="cuda", resume_from: str = None):
     os.makedirs(cfg.lora.ckpt_dir, exist_ok=True)
 
     print("Loading frozen experts + Phase-2 bridge checkpoint ...")
@@ -135,12 +156,26 @@ def train_lora(cfg: Config, bridge_ckpt_path: str, device="cuda"):
         "english": FrozenExpert(cfg.pair.english, cfg.shared, cfg.switch, cfg.handoff_layer, device),
         "python": FrozenExpert(cfg.pair.python, cfg.shared, cfg.switch, cfg.handoff_layer, device),
     }
-    load_bridge_checkpoint(experts, bridge_ckpt_path)
 
-    print("Attaching LoRA adapters ...")
-    for e in experts.values():
-        attach_lora(e, cfg.lora)
-        e.gradient_checkpointing_enable()
+    start_step = 0
+    if resume_from is not None:
+        print(f"Resuming Phase 3 from {resume_from} ...")
+        for name, e in experts.items():
+            attach_lora_from_checkpoint(e, os.path.join(resume_from, f"{name}_lora"))
+            e.gradient_checkpointing_enable()
+        early_stop_state = load_bridge_checkpoint(experts, os.path.join(resume_from, "bridge.pt"))
+        import re as _re
+        m = _re.search(r"step(\d+)", os.path.basename(resume_from.rstrip("/")))
+        start_step = int(m.group(1)) if m else 0
+        print(f"Resumed at inferred start_step={start_step}. Note optimizer "
+              f"(AdamW) state is NOT restored, only LoRA + bridge weights.")
+    else:
+        print("Loading Phase-2 bridge checkpoint (fresh LoRA attach) ...")
+        load_bridge_checkpoint(experts, bridge_ckpt_path)
+        print("Attaching LoRA adapters ...")
+        for e in experts.values():
+            attach_lora(e, cfg.lora)
+            e.gradient_checkpointing_enable()
 
     pairs = load_pairs(cfg.data.processed_path)
     train_pairs, val_pairs = train_val_split(pairs, cfg.data.val_fraction, cfg.data.seed)
@@ -159,8 +194,9 @@ def train_lora(cfg: Config, bridge_ckpt_path: str, device="cuda"):
     import random
     rng = random.Random(cfg.data.seed)
     t0 = time.time()
+    best_val = float("inf")
 
-    for step in range(cfg.lora.steps_max):
+    for step in range(start_step, cfg.lora.steps_max):
         lr = _cosine_warmup_lr(step, cfg.lora.warmup_steps, cfg.lora.steps_max, cfg.lora.lr)
         for g in optimizer.param_groups:
             g["lr"] = lr
@@ -183,7 +219,12 @@ def train_lora(cfg: Config, bridge_ckpt_path: str, device="cuda"):
                   f"loss={step_loss:.4f} ({elapsed:.0f}s elapsed)")
 
         if step > 0 and step % cfg.lora.ckpt_every == 0:
+            val_loss = evaluate_mixed(val_sessions, experts, device, cfg.lora.switch_loss_weight)
+            print(f"[lora] step {step:5d} VAL loss={val_loss:.4f}")
             save_lora_checkpoint(experts, cfg.lora.ckpt_dir, f"lora_step{step}")
+            if val_loss < best_val:
+                best_val = val_loss
+                save_lora_checkpoint(experts, cfg.lora.ckpt_dir, "lora_best")
 
     save_lora_checkpoint(experts, cfg.lora.ckpt_dir, "lora_final")
     return experts
@@ -202,10 +243,18 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--debug", action="store_true")
-    ap.add_argument("--bridge-ckpt", required=True,
+    ap.add_argument("--bridge-ckpt", default=None,
                      help="path to a checkpoint saved by train_stitch.py, e.g. "
-                          "checkpoints/model_stitched_best.pt")
+                          "checkpoints/model_stitched_best.pt (required unless "
+                          "--resume-from is given)")
+    ap.add_argument("--resume-from", default=None,
+                     help="path to a directory saved by this script's "
+                          "save_lora_checkpoint, e.g. checkpoints/lora_step200, "
+                          "to continue a Phase-3 run after a disconnect")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
+    if args.bridge_ckpt is None and args.resume_from is None:
+        ap.error("must pass either --bridge-ckpt (fresh Phase 3 start) or "
+                  "--resume-from (continue a Phase 3 run)")
     cfg = Config.debug() if args.debug else Config.default()
-    train_lora(cfg, args.bridge_ckpt, device=args.device)
+    train_lora(cfg, args.bridge_ckpt, device=args.device, resume_from=args.resume_from)
