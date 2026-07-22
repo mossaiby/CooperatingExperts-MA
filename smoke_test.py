@@ -72,7 +72,14 @@ def main():
     print("\n--- Mixed session loss (phase 3 shape check, no LoRA attached) ---")
     sessions = build_sessions(FAKE_PAIRS, seed=0)
     chunks = encode_session(sessions[0], experts, max_seq_len=64)
-    mloss = mixed_loss_for_session(chunks, experts, device, switch_loss_weight=0.1)
+    mloss = mixed_loss_for_session(chunks, experts, device, switch_loss_weight=5.0)
+    # sanity check that the switch token is actually present in the encoded
+    # session -- this exact check would have caught the earlier bug where
+    # switch_id was computed but never inserted into ids
+    switch_present = any(c.get("has_switch_prefix") and c["ids"][0] == c["switch_id"]
+                          for c in chunks)
+    assert switch_present, "switch token missing from encoded session -- regression of a past bug!"
+    print("switch token confirmed present in encoded session chunks")
     mloss.backward()
     print(f"mixed_loss_for_session OK: loss={mloss.item():.4f}")
 

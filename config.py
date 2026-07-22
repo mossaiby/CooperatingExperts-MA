@@ -200,7 +200,12 @@ class LoraTrainConfig:
     steps_max: int = 2000
     warmup_steps: int = 100
     grad_clip: float = 0.5
-    switch_loss_weight: float = 0.1
+    switch_loss_weight: float = 5.0  # UP-weight, not down-weight -- see
+                             # mixed_loss_for_session docstring. Switch
+                             # tokens are rare (1-2 per session) and, now
+                             # that they're actually present in training
+                             # data (a prior bug meant they weren't), need
+                             # a stronger gradient to be learned at all.
     log_every: int = 5
     ckpt_dir: str = "checkpoints"
     ckpt_every: int = 20           # frequent -- Phase 2 taught us sessions can die early

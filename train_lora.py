@@ -90,13 +90,16 @@ def build_sessions(pairs, seed=0):
 
 def encode_session(session, experts, max_seq_len):
     """
-    Tokenizes each segment with its own expert's tokenizer, inserts the
-    switch token BEFORE each segment (using the tokenizer of the segment
-    that is about to start, matching v1's boundary-marker convention), and
-    returns a list of (expert_name, token_ids) chunks plus the switch ids
-    used between them. Actual cross-tokenizer concatenation happens at the
-    embedding level in train_step below (can't concat ids from different
-    vocabs into one tensor).
+    Tokenizes each segment with its own expert's tokenizer, and PREPENDS
+    the switch token to every segment after the first (using the target
+    expert's own tokenizer, since that's who "speaks" the switch token as
+    its first move upon receiving the handoff).
+
+    IMPORTANT: earlier versions of this function computed switch_id but
+    never actually inserted it into the segment's ids -- meaning the model
+    was never shown the switch token during Phase-3 training at all, which
+    is why it never learned to emit one spontaneously during generation.
+    This was a real bug, not a "needs more training" issue.
     """
     chunks = []
     for i, seg in enumerate(session["segments"]):
@@ -104,7 +107,13 @@ def encode_session(session, experts, max_seq_len):
         ids = e.tokenizer(seg["text"], truncation=True, max_length=max_seq_len,
                            return_tensors=None)["input_ids"]
         switch_id = e.switch_id(seg["expert"])
-        chunks.append({"expert": seg["expert"], "ids": ids, "switch_id": switch_id})
+        has_switch_prefix = i > 0
+        if has_switch_prefix:
+            ids = [switch_id] + ids
+        chunks.append({
+            "expert": seg["expert"], "ids": ids, "switch_id": switch_id,
+            "has_switch_prefix": has_switch_prefix,
+        })
     return chunks
 
 
@@ -116,6 +125,16 @@ def mixed_loss_for_session(chunks, experts, device, switch_loss_weight, num_vect
     the shared space into segment i's expert -- exactly the Phase-2 handoff
     mechanism, now with LoRA-adapted (not fully frozen) backbones. Loss is
     accumulated per segment and averaged.
+
+    switch_loss_weight now genuinely matters (previously the switch token
+    was never actually present in the training sequence at all -- see
+    encode_session -- so this parameter had no effect regardless of its
+    value). Since a session only contains ~1-2 switch tokens total against
+    dozens of ordinary tokens, the DEFAULT here is now an UP-weight (>1),
+    not a down-weight -- the opposite of v1's from-scratch project, which
+    had the opposite problem (over-switching). Tune switch_loss_weight
+    down again only if you start seeing the model over-switch once this is
+    working.
     """
     total_loss = 0.0
     n = 0
@@ -127,15 +146,25 @@ def mixed_loss_for_session(chunks, experts, device, switch_loss_weight, num_vect
         mask = torch.ones_like(ids)
 
         if carried_vec is None:
-            # first segment: normal LM loss, no injected prefix
+            # first segment: normal LM loss, no injected prefix, no switch
+            # token possible here (nothing to switch FROM yet)
             out = e.backbone(input_ids=ids, attention_mask=mask, labels=ids)
             loss = out.loss
         else:
             logits = e.forward_with_injected_prefix(carried_vec, ids, mask)
-            loss = F.cross_entropy(
+            per_tok_loss = F.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]).float(),
                 ids.reshape(-1),
+                reduction="none",
             )
+            weights = torch.ones_like(per_tok_loss)
+            if chunk.get("has_switch_prefix"):
+                # position 0 of this segment's ids is the switch token
+                # (see encode_session) -- its prediction is made purely
+                # from the injected handoff vector, which is exactly the
+                # signal we want to reinforce
+                weights[0] = switch_loss_weight
+            loss = (per_tok_loss * weights).sum() / weights.sum()
         total_loss += loss
         n += 1
 
