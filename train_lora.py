@@ -286,10 +286,24 @@ if __name__ == "__main__":
                      help="path to a directory saved by this script's "
                           "save_lora_checkpoint, e.g. checkpoints/lora_step200, "
                           "to continue a Phase-3 run after a disconnect")
+    ap.add_argument("--switch-loss-weight", type=float, default=None,
+                     help="override cfg.lora.switch_loss_weight (up-weight "
+                          "multiplier applied to the switch-token position "
+                          "in each non-first segment's loss)")
+    ap.add_argument("--steps-max", type=int, default=None,
+                     help="override cfg.lora.steps_max")
+    ap.add_argument("--ckpt-dir", default=None,
+                     help="override cfg.lora.ckpt_dir")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     if args.bridge_ckpt is None and args.resume_from is None:
         ap.error("must pass either --bridge-ckpt (fresh Phase 3 start) or "
                   "--resume-from (continue a Phase 3 run)")
     cfg = Config.debug() if args.debug else Config.default()
+    if args.switch_loss_weight is not None:
+        cfg.lora.switch_loss_weight = args.switch_loss_weight
+    if args.steps_max is not None:
+        cfg.lora.steps_max = args.steps_max
+    if args.ckpt_dir is not None:
+        cfg.lora.ckpt_dir = args.ckpt_dir
     train_lora(cfg, args.bridge_ckpt, device=args.device, resume_from=args.resume_from)

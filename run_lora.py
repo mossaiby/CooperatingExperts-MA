@@ -45,6 +45,8 @@ def main():
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--steps-max", type=int, default=None)
+    ap.add_argument("--switch-loss-weight", type=float, default=None,
+                     help="override cfg.lora.switch_loss_weight")
     ap.add_argument("--no-resume", action="store_true")
     args, _ = ap.parse_known_args()
 
@@ -54,6 +56,8 @@ def main():
     cfg.lora.ckpt_dir = args.ckpt_dir
     if args.steps_max is not None:
         cfg.lora.steps_max = args.steps_max
+    if args.switch_loss_weight is not None:
+        cfg.lora.switch_loss_weight = args.switch_loss_weight
 
     resume_from = None
     if not args.no_resume:
